@@ -226,6 +226,9 @@ class ScreenshotImageLoader(BaseImageLoader):
         self._success_callback: Optional[Callable[[], None]] = None
         self._screenshot_uris: list[str] = []
         self.window = window
+        self._hide_signal_id: Optional[int] = None
+        self._hide_timeout_id: Optional[int] = None
+        self._pending_flags: Xdp.ScreenshotFlags = Xdp.ScreenshotFlags.INTERACTIVE
 
     def _update_delete_action_state(self) -> None:
         action = self.window.lookup_action("delete-screenshots")
@@ -241,18 +244,38 @@ class ScreenshotImageLoader(BaseImageLoader):
         try:
             self._error_callback = on_error_or_cancel
             self._success_callback = on_success
+            self._pending_flags = flags
+            self._hide_signal_id = self.window.connect("hide", self._on_window_hidden)
+            self._hide_timeout_id = GLib.timeout_add(500, self._on_hide_timeout, flags)
             self.window.hide()
-            GLib.timeout_add(150, self._do_take_screenshot, flags)
         except Exception as e:
             logger.error(f"Failed to initiate screenshot: {e}")
             self.window._show_notification(_("Failed to take screenshot"))
             if on_error_or_cancel:
                 on_error_or_cancel(str(e))
 
+    def _on_window_hidden(self, window) -> None:
+        if self._hide_signal_id:
+            self.window.disconnect(self._hide_signal_id)
+            self._hide_signal_id = None
+        if self._hide_timeout_id:
+            GLib.source_remove(self._hide_timeout_id)
+            self._hide_timeout_id = None
+        self._do_take_screenshot(self._pending_flags)
+
+    def _on_hide_timeout(self, flags: Xdp.ScreenshotFlags) -> bool:
+        if self._hide_signal_id:
+            self.window.disconnect(self._hide_signal_id)
+            self._hide_signal_id = None
+        self._hide_timeout_id = None
+        self._do_take_screenshot(flags)
+        return False
+
     def _do_take_screenshot(self, flags: Xdp.ScreenshotFlags) -> bool:
         try:
+            parent = Xdp.Parent.new_gtk(self.window)
             self.portal.take_screenshot(
-                None,
+                parent,
                 flags,
                 None,
                 self._on_screenshot_taken,
