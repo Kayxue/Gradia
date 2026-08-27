@@ -18,10 +18,19 @@
 import os
 import mimetypes
 import shutil
+import subprocess
+import time
 import threading
 from urllib.parse import urlparse, unquote
 import urllib.request
+import gi
 from gi.repository import Gtk, Gio, Gdk, GLib, Xdp
+
+try:
+    gi.require_version('XdpGtk4', '1.0')
+    from gi.repository import XdpGtk4
+except Exception:
+    XdpGtk4 = None
 from gradia.clipboard import save_texture_to_file
 from gradia.ui.image_creation.source_image_generator import SourceImageGeneratorWindow
 from gradia.utils.timestamp_filename import TimestampedFilenameGenerator
@@ -229,6 +238,12 @@ class ScreenshotImageLoader(BaseImageLoader):
         self._hide_signal_id: Optional[int] = None
         self._hide_timeout_id: Optional[int] = None
         self._pending_flags: Xdp.ScreenshotFlags = Xdp.ScreenshotFlags.INTERACTIVE
+        self._fallback_proc: Optional[subprocess.Popen] = None
+        self._fallback_path: Optional[str] = None
+        self._fallback_timeout_id: Optional[int] = None
+        self._fallback_start_time: float = 0.0
+        self._niri_finished: bool = False
+        self._niri_stream_proc: Optional[subprocess.Popen] = None
 
     def _update_delete_action_state(self) -> None:
         action = self.window.lookup_action("delete-screenshots")
@@ -273,7 +288,12 @@ class ScreenshotImageLoader(BaseImageLoader):
 
     def _do_take_screenshot(self, flags: Xdp.ScreenshotFlags) -> bool:
         try:
-            parent = Xdp.Parent.new_gtk(self.window)
+            parent = None
+            if XdpGtk4 and hasattr(XdpGtk4, 'parent_new_gtk') and self.window:
+                try:
+                    parent = XdpGtk4.parent_new_gtk(self.window)
+                except Exception as e:
+                    logger.warning(f"Failed to create GTK parent for portal: {e}")
             self.portal.take_screenshot(
                 parent,
                 flags,
@@ -282,12 +302,8 @@ class ScreenshotImageLoader(BaseImageLoader):
                 None
             )
         except Exception as e:
-            logger.info(f"Failed during screenshot: {e}")
-            self.window._show_notification(_("Failed to take screenshot"))
-            self.window.show()
-            if self._error_callback:
-                self._error_callback(str(e))
-            self._error_callback = None
+            logger.warning(f"Failed during portal screenshot initiation: {e}. Trying CLI fallback...")
+            self._try_fallback_screenshot(flags)
         return False
 
     def _on_screenshot_taken(self, portal_object, result, user_data) -> None:
@@ -296,14 +312,257 @@ class ScreenshotImageLoader(BaseImageLoader):
             self._screenshot_uris.append(uri)
             self._handle_screenshot_uri(uri)
             self._update_delete_action_state()
-        except GLib.Error as e:
-            logger.error(f"Screenshot error: {e}")
-            self.window._show_notification(_("Screenshot cancelled"))
-            if self._error_callback:
-                self._error_callback(str(e))
-        finally:
             self.window.show()
             self._error_callback = None
+        except Exception as e:
+            logger.warning(f"Portal screenshot failed or cancelled: {e}. Trying CLI fallback...")
+            self._try_fallback_screenshot(self._pending_flags)
+
+    def _try_fallback_screenshot(self, flags: Xdp.ScreenshotFlags) -> None:
+        if self._fallback_timeout_id:
+            GLib.source_remove(self._fallback_timeout_id)
+            self._fallback_timeout_id = None
+
+        if self._niri_stream_proc:
+            try:
+                self._niri_stream_proc.kill()
+            except Exception:
+                pass
+            self._niri_stream_proc = None
+        self._niri_finished = False
+
+        filename = TimestampedFilenameGenerator().generate(_("Edited Screenshot From %Y-%m-%d %H-%M-%S")) + ".png"
+        in_flatpak = os.path.exists("/.flatpak-info")
+        if in_flatpak:
+            pictures_dir = os.path.realpath(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES) or os.path.expanduser("~/Pictures"))
+            base_dir = os.path.join(pictures_dir, ".gradia_temp")
+            os.makedirs(base_dir, exist_ok=True)
+            temp_path = os.path.abspath(os.path.join(base_dir, filename))
+        else:
+            temp_path = os.path.abspath(os.path.join(self.temp_dir, filename))
+
+        is_interactive = (flags == Xdp.ScreenshotFlags.INTERACTIVE)
+        cmd = self._get_fallback_screenshot_cmd(temp_path, is_interactive)
+
+        if not cmd:
+            logger.error("No suitable screenshot tool found for fallback.")
+            self.window._show_notification(_("Failed to take screenshot"))
+            self.window.show()
+            if self._error_callback:
+                self._error_callback("No screenshot tool available")
+            self._error_callback = None
+            return
+
+        try:
+            logger.info(f"Executing fallback screenshot command: {cmd}")
+            self._fallback_proc = subprocess.Popen(cmd)
+            self._fallback_path = temp_path
+            self._fallback_start_time = time.time()
+
+            if "niri" in cmd or (len(cmd) > 1 and "niri" in cmd[1]):
+                self._start_niri_monitor(in_flatpak)
+
+            self._fallback_timeout_id = GLib.timeout_add(150, self._check_fallback_status)
+        except Exception as e:
+            logger.error(f"Failed to launch fallback screenshot process: {e}")
+            self.window._show_notification(_("Failed to take screenshot"))
+            self.window.show()
+            if self._error_callback:
+                self._error_callback(str(e))
+            self._error_callback = None
+
+    def _start_niri_monitor(self, in_flatpak: bool) -> None:
+        stream_cmd = ["niri", "msg", "event-stream"]
+        if in_flatpak:
+            stream_cmd = ["flatpak-spawn", "--host"] + stream_cmd
+
+        def watch_events():
+            try:
+                proc = subprocess.Popen(stream_cmd, stdout=subprocess.PIPE, text=True)
+                self._niri_stream_proc = proc
+                focus_lost = False
+                for line in proc.stdout:
+                    l = line.strip()
+                    if "Window focus changed: None" in l or "Overview toggled: true" in l:
+                        focus_lost = True
+                    elif focus_lost and ("Window focus changed: Some" in l or "Overview toggled: false" in l):
+                        time.sleep(0.1)
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        self._niri_finished = True
+                        break
+            except Exception as e:
+                logger.warning(f"Error monitoring Niri events: {e}")
+
+        threading.Thread(target=watch_events, daemon=True).start()
+
+    def _get_fallback_screenshot_cmd(self, target_path: str, is_interactive: bool) -> Optional[list[str]]:
+        in_flatpak = os.path.exists("/.flatpak-info")
+
+        def check_cmd(cmd_name: str) -> bool:
+            if shutil.which(cmd_name):
+                return True
+            if in_flatpak:
+                try:
+                    res = subprocess.run(["flatpak-spawn", "--host", "which", cmd_name], capture_output=True)
+                    return res.returncode == 0
+                except Exception:
+                    return False
+            return False
+
+        def wrap_cmd(cmd_args: list[str]) -> list[str]:
+            if in_flatpak and not shutil.which(cmd_args[0]):
+                return ["flatpak-spawn", "--host"] + cmd_args
+            return cmd_args
+
+        # 1. Niri (Wayland scrollable compositor)
+        if check_cmd("niri"):
+            action = "screenshot" if is_interactive else "screenshot-screen"
+            return wrap_cmd(["niri", "msg", "action", action, "--path", target_path])
+
+        # 2. Hyprshot (Hyprland)
+        if check_cmd("hyprshot"):
+            mode = "region" if is_interactive else "output"
+            out_dir = os.path.dirname(target_path)
+            out_file = os.path.basename(target_path)
+            return wrap_cmd(["hyprshot", "-m", mode, "-o", out_dir, "-f", out_file, "--silent"])
+
+        # 3. Grimshot (Sway/Wayland)
+        if check_cmd("grimshot"):
+            mode = "area" if is_interactive else "output"
+            return wrap_cmd(["grimshot", "save", mode, target_path])
+
+        # 4. Grim (+ Slurp for region)
+        if check_cmd("grim"):
+            if is_interactive and check_cmd("slurp"):
+                if in_flatpak and not shutil.which("grim"):
+                    return ["flatpak-spawn", "--host", "sh", "-c", f'grim -g "$(slurp)" "{target_path}"']
+                return ["sh", "-c", f'grim -g "$(slurp)" "{target_path}"']
+            elif not is_interactive:
+                return wrap_cmd(["grim", target_path])
+
+        # 5. GNOME Screenshot
+        if check_cmd("gnome-screenshot"):
+            flags = ["-a", "-f", target_path] if is_interactive else ["-f", target_path]
+            return wrap_cmd(["gnome-screenshot"] + flags)
+
+        # 6. Spectacle (KDE)
+        if check_cmd("spectacle"):
+            mode = "-r" if is_interactive else "-f"
+            return wrap_cmd(["spectacle", "-b", mode, "-o", target_path])
+
+        # 7. Flameshot
+        if check_cmd("flameshot"):
+            if is_interactive:
+                if in_flatpak and not shutil.which("flameshot"):
+                    return ["flatpak-spawn", "--host", "sh", "-c", f'flameshot gui -r > "{target_path}"']
+                return ["sh", "-c", f'flameshot gui -r > "{target_path}"']
+            else:
+                return wrap_cmd(["flameshot", "full", "-p", target_path])
+
+        # 8. XFCE Screenshooter
+        if check_cmd("xfce4-screenshooter"):
+            flags = ["-r", "-s", target_path] if is_interactive else ["-f", "-s", target_path]
+            return wrap_cmd(["xfce4-screenshooter"] + flags)
+
+        # 9. Scrot
+        if check_cmd("scrot"):
+            flags = ["-s", target_path] if is_interactive else [target_path]
+            return wrap_cmd(["scrot"] + flags)
+
+        # 10. Maim
+        if check_cmd("maim"):
+            flags = ["-s", target_path] if is_interactive else [target_path]
+            return wrap_cmd(["maim"] + flags)
+
+        # 11. ImageMagick Import (X11 only)
+        if check_cmd("import") and os.environ.get("XDG_SESSION_TYPE") != "wayland":
+            return wrap_cmd(["import", target_path])
+
+        return None
+
+    def _check_fallback_status(self) -> bool:
+        target_path = self._fallback_path
+        proc = self._fallback_proc
+
+        def cleanup_niri_stream():
+            if self._niri_stream_proc:
+                try:
+                    self._niri_stream_proc.kill()
+                except Exception:
+                    pass
+                self._niri_stream_proc = None
+
+        if target_path and os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+            logger.info(f"Fallback screenshot created {target_path}")
+            self._fallback_timeout_id = None
+            cleanup_niri_stream()
+            self.window.show()
+            try:
+                uri = Gio.File.new_for_path(target_path).get_uri()
+                self._screenshot_uris.append(uri)
+                self._set_image_and_update_ui(target_path, ImageOrigin.Screenshot, screenshot_path=target_path, copy_after_processing=True)
+                self.window._show_notification(_("Screenshot captured!"))
+                self._update_delete_action_state()
+                if self._success_callback:
+                    self._success_callback()
+            except Exception as e:
+                logger.error(f"Error processing fallback screenshot: {e}")
+                self.window._show_notification(_("Failed to process screenshot"))
+            finally:
+                self._error_callback = None
+            return False
+
+        # If Niri screenshot UI closed without writing the file -> cancelled
+        if self._niri_finished:
+            logger.info("Niri screenshot UI closed without writing target file (cancelled)")
+            self._fallback_timeout_id = None
+            cleanup_niri_stream()
+            self.window.show()
+            self.window._show_notification(_("Screenshot cancelled"))
+            if self._error_callback:
+                self._error_callback("Screenshot cancelled")
+            self._error_callback = None
+            return False
+
+        # For non-Niri CLI tools: if process exited without creating target file
+        if proc and proc.poll() is not None and not self._is_niri_cmd(proc):
+            logger.info(f"Fallback process exited with code {proc.returncode} without target file")
+            self._fallback_timeout_id = None
+            cleanup_niri_stream()
+            self.window.show()
+            self.window._show_notification(_("Screenshot cancelled"))
+            if self._error_callback:
+                self._error_callback("Screenshot cancelled")
+            self._error_callback = None
+            return False
+
+        # Timeout after 30 seconds if file is not created
+        if time.time() - self._fallback_start_time > 30:
+            logger.warning("Fallback screenshot timed out")
+            self._fallback_timeout_id = None
+            cleanup_niri_stream()
+            self.window.show()
+            self.window._show_notification(_("Failed to take screenshot"))
+            if self._error_callback:
+                self._error_callback("Timed out waiting for screenshot")
+            self._error_callback = None
+            if proc and proc.poll() is None:
+                proc.kill()
+            return False
+
+        return True
+
+    def _is_niri_cmd(self, proc: subprocess.Popen) -> bool:
+        if hasattr(proc, 'args'):
+            args = proc.args
+            if isinstance(args, list):
+                return any('niri' in str(a) for a in args)
+            elif isinstance(args, str):
+                return 'niri' in args
+        return False
 
     def _handle_screenshot_uri(self, uri: str) -> None:
         try:

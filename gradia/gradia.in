@@ -41,6 +41,142 @@ class QuickStartScreenshotTaker:
         self.portal = Xdp.Portal()
         self._loop = None
         self._result_path = None
+
+    def _try_cli_fallback(self, flags) -> str | None:
+        import shutil
+        import subprocess
+        import time
+        import tempfile
+        is_interactive = (flags == Xdp.ScreenshotFlags.INTERACTIVE)
+        in_flatpak = os.path.exists("/.flatpak-info")
+
+        if in_flatpak:
+            pictures_dir = os.path.realpath(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES) or os.path.expanduser("~/Pictures"))
+            base_dir = os.path.join(pictures_dir, ".gradia_temp")
+            os.makedirs(base_dir, exist_ok=True)
+            target_path = os.path.abspath(os.path.join(base_dir, f"gradia_screenshot_{int(time.time())}.png"))
+        else:
+            temp_dir = tempfile.gettempdir()
+            target_path = os.path.abspath(os.path.join(temp_dir, f"gradia_screenshot_{int(time.time())}.png"))
+
+        def check_cmd(cmd_name: str) -> bool:
+            if shutil.which(cmd_name):
+                return True
+            if in_flatpak:
+                try:
+                    res = subprocess.run(["flatpak-spawn", "--host", "which", cmd_name], capture_output=True)
+                    return res.returncode == 0
+                except Exception:
+                    return False
+            return False
+
+        def wrap_cmd(cmd_args: list[str]) -> list[str]:
+            if in_flatpak and not shutil.which(cmd_args[0]):
+                return ["flatpak-spawn", "--host"] + cmd_args
+            return cmd_args
+
+        cmd = None
+        if check_cmd("niri"):
+            action = "screenshot" if is_interactive else "screenshot-screen"
+            cmd = wrap_cmd(["niri", "msg", "action", action, "--path", target_path])
+        elif check_cmd("hyprshot"):
+            mode = "region" if is_interactive else "output"
+            out_dir = os.path.dirname(target_path)
+            out_file = os.path.basename(target_path)
+            cmd = wrap_cmd(["hyprshot", "-m", mode, "-o", out_dir, "-f", out_file, "--silent"])
+        elif check_cmd("grimshot"):
+            mode = "area" if is_interactive else "output"
+            cmd = wrap_cmd(["grimshot", "save", mode, target_path])
+        elif check_cmd("grim"):
+            if is_interactive and check_cmd("slurp"):
+                if in_flatpak and not shutil.which("grim"):
+                    cmd = ["flatpak-spawn", "--host", "sh", "-c", f'grim -g "$(slurp)" "{target_path}"']
+                else:
+                    cmd = ["sh", "-c", f'grim -g "$(slurp)" "{target_path}"']
+            elif not is_interactive:
+                cmd = wrap_cmd(["grim", target_path])
+        elif check_cmd("gnome-screenshot"):
+            flags_list = ["-a", "-f", target_path] if is_interactive else ["-f", target_path]
+            cmd = wrap_cmd(["gnome-screenshot"] + flags_list)
+        elif check_cmd("spectacle"):
+            mode = "-r" if is_interactive else "-f"
+            cmd = wrap_cmd(["spectacle", "-b", mode, "-o", target_path])
+        elif check_cmd("flameshot"):
+            if is_interactive:
+                if in_flatpak and not shutil.which("flameshot"):
+                    cmd = ["flatpak-spawn", "--host", "sh", "-c", f'flameshot gui -r > "{target_path}"']
+                else:
+                    cmd = ["sh", "-c", f'flameshot gui -r > "{target_path}"']
+            else:
+                cmd = wrap_cmd(["flameshot", "full", "-p", target_path])
+        elif check_cmd("xfce4-screenshooter"):
+            flags_list = ["-r", "-s", target_path] if is_interactive else ["-f", "-s", target_path]
+            cmd = wrap_cmd(["xfce4-screenshooter"] + flags_list)
+        elif check_cmd("scrot"):
+            flags_list = ["-s", target_path] if is_interactive else [target_path]
+            cmd = wrap_cmd(["scrot"] + flags_list)
+        elif check_cmd("maim"):
+            flags_list = ["-s", target_path] if is_interactive else [target_path]
+            cmd = wrap_cmd(["maim"] + flags_list)
+        elif check_cmd("import") and os.environ.get("XDG_SESSION_TYPE") != "wayland":
+            cmd = wrap_cmd(["import", target_path])
+
+        if not cmd:
+            return None
+
+        try:
+            import threading
+            proc = subprocess.Popen(cmd)
+            start_time = time.time()
+
+            niri_finished = [False]
+            if "niri" in cmd or (len(cmd) > 1 and "niri" in cmd[1]):
+                def watch_niri():
+                    stream_cmd = ["niri", "msg", "event-stream"]
+                    if in_flatpak:
+                        stream_cmd = ["flatpak-spawn", "--host"] + stream_cmd
+                    try:
+                        eproc = subprocess.Popen(stream_cmd, stdout=subprocess.PIPE, text=True)
+                    except Exception:
+                        return
+                    focus_lost = False
+                    start_t = time.time()
+                    try:
+                        for line in eproc.stdout:
+                            l = line.strip()
+                            if "Window focus changed: None" in l or "Overview toggled: true" in l:
+                                focus_lost = True
+                            elif focus_lost and ("Window focus changed: Some" in l or "Overview toggled: false" in l):
+                                time.sleep(0.1)
+                                try:
+                                    eproc.kill()
+                                except Exception:
+                                    pass
+                                niri_finished[0] = True
+                                return
+                            if time.time() - start_t > 30:
+                                try:
+                                    eproc.kill()
+                                except Exception:
+                                    pass
+                                niri_finished[0] = True
+                                return
+                    except Exception:
+                        pass
+                threading.Thread(target=watch_niri, daemon=True).start()
+
+            while time.time() - start_time < 30:
+                if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+                    return target_path
+                if proc.poll() is not None and not ("niri" in cmd or (len(cmd) > 1 and "niri" in cmd[1])):
+                    break
+                if niri_finished[0]:
+                    break
+                time.sleep(0.15)
+        except Exception as e:
+            print("CLI fallback screenshot failed:", e)
+        return None
+
     def take_screenshot(self, flags=Xdp.ScreenshotFlags.INTERACTIVE, delay_ms=0) -> str | None:
         def on_finish(portal, result, user_data):
             from gi.repository import Gio
@@ -52,14 +188,20 @@ class QuickStartScreenshotTaker:
                     raise Exception("Failed to get local file path from URI")
                 self._result_path = path
             except Exception as e:
-                print("Screenshot failed:", e)
-                self._result_path = None
+                print("Portal screenshot failed:", e)
+                self._result_path = self._try_cli_fallback(flags)
             finally:
                 if self._loop:
                     self._loop.quit()
 
         def start_screenshot():
-            self.portal.take_screenshot(None, flags, None, on_finish, None)
+            try:
+                self.portal.take_screenshot(None, flags, None, on_finish, None)
+            except Exception as e:
+                print("Failed to initiate portal screenshot:", e)
+                self._result_path = self._try_cli_fallback(flags)
+                if self._loop:
+                    self._loop.quit()
             return False  # Remove the timeout
 
         self._loop = GLib.MainLoop()
